@@ -1,0 +1,75 @@
+# ============================================
+# 线粒体合成数据生成配置
+# Mitochondria Synthetic Data Generation Config
+# ============================================
+
+# 路径配置
+paths:
+  # 单个线粒体素材
+  actors_dir: "C:/Users/Guo_lab/Desktop/ALL_model/three_label_convlstm/data/single_mito/raw/"
+  masks_dir: "C:/Users/Guo_lab/Desktop/ALL_model/three_label_convlstm/data/single_mito/label/"
+
+  # 输出目录
+  output_dir: "C:/Users/Guo_lab/Desktop/ALL_model/three_label_convlstm/data/synthetic_data/5frame_256x256_2000/"
+#  output_dir: "C:/Users/Guo_lab/Desktop/ALL_model/three_label_convlstm/data/test_data/"
+# 数据生成参数
+generation:
+  num_sequences: 2000      # 生成序列数量
+  seed: 42                   # 随机种子（可复现）
+
+# 序列参数
+sequence:
+  num_frames: 5              # 帧数
+  canvas_size: 256           # 画布尺寸 (256x256)
+  bit_depth: 8              # 位深度
+  contact_frame: 2           # 交叠最大的帧 (0-indexed，即第3帧)
+
+# 运动参数
+motion:
+  # 速度范围 (像素/帧)
+  speed_range: [8.0, 20.0]
+
+  # 旋转速度 (度/帧)
+  rotation_speed_range: [-5.0, 5.0]
+
+  # 轨迹类型权重
+  trajectory_weights:
+    linear: 0.5              # 直线运动
+    curved: 0.25             # 曲线运动
+    wobble: 0.25             # 摆动运动
+
+  # 角度模式权重
+  angle_mode_weights:
+    symmetric: 0.3           # 180度对撞
+    perpendicular: 0.25      # 90度交叉
+    oblique: 0.25            # 45度斜切
+    chase: 0.1               # 同向追逐
+    random: 0.1              # 完全随机
+
+# 光学参数
+optical:
+  # 亮度范围
+  brightness_range: [0.7, 1.0]
+
+  # 荧光衰减
+  decay_range: [1.0, 1.0]
+
+  # 背景噪声
+  background_noise: [0,0]
+
+  # 位置抖动
+  position_jitter: 1.0
+
+# 标签说明
+# label_format: "instance_with_overlap"
+# 0 = 背景
+# 1 = 线粒体1 (包括其在交叠区的部分，但交叠区会被标记为2)
+# 2 = 交叠区
+# 3 = 线粒体2 (包括其在交叠区的部分，但交叠区会被标记为2)
+#
+# 实际存储：
+# - raw/: 合成图像 (T, H, W) 16bit TIF
+# - label/: 三分类标签 (T, H, W)
+#   - 0: 背景
+#   - 奇数(1,3,5...): 线粒体独占区
+#   - 偶数(2,4,6...): 交叠区

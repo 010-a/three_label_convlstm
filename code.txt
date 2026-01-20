@@ -1,0 +1,1050 @@
+"""
+真实线粒体数据训练配置
+Real Mitochondria Overlap Separation Training Configuration
+
+数据：256x256 5帧 TIF序列（真实线粒体片段合成）
+模型：ConvLSTM-UNet
+Loss：序列级PIT + 时序连续约束
+"""
+
+from pathlib import Path
+import torch
+
+
+class Config:
+    # ==================== 实验信息 ====================
+    exp_name = "real_mito_separation"
+    exp_version = "v1.0"
+    description = """
+    使用真实线粒体片段合成的运动序列训练分离模型。
+    目标：学习在交叠区分离两条线粒体。
+    """
+
+    # ==================== 路径配置 ====================
+    # 原始数据目录（存放TIF文件）
+    raw_data_dir = Path("./data/raw")
+
+    # 处理后数据目录
+    processed_data_dir = Path("./data/processed")
+
+    # 输出目录
+    output_dir = Path("./output")
+
+    # ==================== 数据参数 ====================
+    img_size = 256  # 图像尺寸
+    num_frames = 5  # 每个序列的帧数
+    num_classes = 4  # 0=背景, 1=mito1_only, 2=mito2_only, 3=overlap
+
+    # 数据划分
+    train_ratio = 0.8  # 训练集比例
+    val_ratio = 0.2  # 验证集比例
+
+    # 前景检测阈值（用于自动生成标签）
+    foreground_threshold = 0.1  # 相对于最大值的比例
+
+    # ==================== 数据增强 ====================
+    augmentation = True
+    aug_flip_h = True  # 水平翻转
+    aug_flip_v = True  # 垂直翻转
+    aug_rotate = True  # 90度旋转
+    aug_brightness = True  # 亮度扰动
+    brightness_range = (0.7, 1.3)
+
+    # ==================== 模型参数 ====================
+    model_type = "ConvLSTM-UNet"
+    in_channels = 1
+    base_ch = 32  # 基础通道数
+    lstm_hidden = 64  # ConvLSTM隐藏层维度
+    bidirectional = True  # 双向LSTM
+
+    # ==================== Loss参数 ====================
+    # 序列级PIT分割Loss
+    seg_loss_weight = 1.0
+    seg_loss_type = "mse"  # "mse" or "dice"
+
+    # 时序连续Loss
+    temporal_loss_weight = 0.5
+    temporal_dilate_kernel = 7
+
+    # 重建Loss
+    recon_loss_weight = 0.2
+
+    # ==================== 训练参数 ====================
+    batch_size = 4  # 256x256图像，batch稍小
+    epochs = 200
+    lr = 1e-3
+    lr_min = 1e-6
+    weight_decay = 1e-4
+
+    # 学习率调度
+    scheduler = "cosine"  # "cosine" or "step"
+
+    # 验证和保存
+    val_interval = 5  # 每N个epoch验证一次
+    save_interval = 20  # 每N个epoch保存一次checkpoint
+    early_stop_patience = 50  # 早停耐心值
+
+    # ==================== 其他 ====================
+    num_workers = 4
+    pin_memory = True
+    seed = 42
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # ==================== 可视化 ====================
+    vis_num_samples = 6  # 可视化样本数
+    vis_dpi = 150  # 图像DPI
+
+    @classmethod
+    def print_config(cls):
+        print("=" * 70)
+        print(f"  实验名称: {cls.exp_name} ({cls.exp_version})")
+        print("=" * 70)
+        print(f"  数据: {cls.img_size}x{cls.img_size}, {cls.num_frames}帧")
+        print(f"  模型: {cls.model_type}, base_ch={cls.base_ch}, lstm_hidden={cls.lstm_hidden}")
+        print(
+            f"  Loss权重: seg={cls.seg_loss_weight}, temporal={cls.temporal_loss_weight}, recon={cls.recon_loss_weight}")
+        print(f"  训练: batch={cls.batch_size}, epochs={cls.epochs}, lr={cls.lr}")
+        print(f"  设备: {cls.device}")
+        print("=" * 70)
+
+    @classmethod
+    def save_config(cls, path):
+        """保存配置到文件"""
+        with open(path, 'w') as f:
+            f.write(f"# {cls.exp_name} Configuration\n")
+            f.write(f"# Version: {cls.exp_version}\n\n")
+            for key, value in vars(cls).items():
+                if not key.startswith('_') and not callable(value):
+                    f.write(f"{key} = {repr(value)}\n")
+"""
+数据集定义
+Dataset Definitions
+"""
+
+import torch
+from torch.utils.data import Dataset
+import numpy as np
+
+
+class MitoSequenceDataset(Dataset):
+    """
+    线粒体序列数据集
+
+    数据格式：
+    - images: (N, T, H, W) 图像序列
+    - labels: (N, T, H, W) 4类标签
+    - masks1: (N, T, H, W) mito1的完整mask
+    - masks2: (N, T, H, W) mito2的完整mask
+    """
+
+    def __init__(self, data_path, augment=False, normalize=True, cfg=None):
+        """
+        Args:
+            data_path: NPZ文件路径
+            augment: 是否进行数据增强
+            normalize: 是否归一化
+            cfg: 配置对象
+        """
+        data = np.load(data_path)
+        self.images = data['images'].astype(np.float32)
+        self.labels = data['labels'].astype(np.int64)
+        self.masks1 = data['masks1'].astype(np.float32)
+        self.masks2 = data['masks2'].astype(np.float32)
+
+        self.augment = augment
+        self.normalize = normalize
+        self.cfg = cfg
+
+        print(f"加载数据集: {len(self)} 个序列, 形状: {self.images.shape}")
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        images = self.images[idx].copy()  # (T, H, W)
+        labels = self.labels[idx].copy()  # (T, H, W)
+        masks1 = self.masks1[idx].copy()  # (T, H, W)
+        masks2 = self.masks2[idx].copy()  # (T, H, W)
+
+        # 数据增强
+        if self.augment:
+            images, labels, masks1, masks2 = self._augment(images, labels, masks1, masks2)
+
+        # 归一化（每帧独立）
+        if self.normalize:
+            images = self._normalize(images)
+
+        # 转换为tensor
+        images = torch.FloatTensor(images).unsqueeze(1)  # (T, 1, H, W)
+        labels = torch.LongTensor(labels)  # (T, H, W)
+        masks1 = torch.FloatTensor(masks1)  # (T, H, W)
+        masks2 = torch.FloatTensor(masks2)  # (T, H, W)
+
+        return images, labels, masks1, masks2
+
+    def _normalize(self, images):
+        """每帧独立归一化"""
+        T = images.shape[0]
+        for t in range(T):
+            img = images[t]
+            mean = img.mean()
+            std = img.std()
+            if std > 1e-6:
+                images[t] = (img - mean) / std
+            else:
+                images[t] = img - mean
+        return images
+
+    def _augment(self, images, labels, masks1, masks2):
+        """数据增强"""
+        # 水平翻转
+        if self.cfg and self.cfg.aug_flip_h and np.random.rand() > 0.5:
+            images = images[:, :, ::-1].copy()
+            labels = labels[:, :, ::-1].copy()
+            masks1 = masks1[:, :, ::-1].copy()
+            masks2 = masks2[:, :, ::-1].copy()
+
+        # 垂直翻转
+        if self.cfg and self.cfg.aug_flip_v and np.random.rand() > 0.5:
+            images = images[:, ::-1, :].copy()
+            labels = labels[:, ::-1, :].copy()
+            masks1 = masks1[:, ::-1, :].copy()
+            masks2 = masks2[:, ::-1, :].copy()
+
+        # 90度旋转
+        if self.cfg and self.cfg.aug_rotate and np.random.rand() > 0.5:
+            k = np.random.choice([1, 2, 3])
+            images = np.rot90(images, k, axes=(1, 2)).copy()
+            labels = np.rot90(labels, k, axes=(1, 2)).copy()
+            masks1 = np.rot90(masks1, k, axes=(1, 2)).copy()
+            masks2 = np.rot90(masks2, k, axes=(1, 2)).copy()
+
+        # 亮度扰动
+        if self.cfg and self.cfg.aug_brightness and np.random.rand() > 0.5:
+            factor = np.random.uniform(*self.cfg.brightness_range)
+            images = images * factor
+
+        return images, labels, masks1, masks2
+
+
+def create_dataloaders(cfg):
+    """
+    创建训练和验证数据加载器
+    """
+    train_path = cfg.processed_data_dir / "train_data.npz"
+    val_path = cfg.processed_data_dir / "val_data.npz"
+
+    train_dataset = MitoSequenceDataset(
+        train_path,
+        augment=cfg.augmentation,
+        normalize=True,
+        cfg=cfg
+    )
+
+    val_dataset = MitoSequenceDataset(
+        val_path,
+        augment=False,
+        normalize=True,
+        cfg=cfg
+    )
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=cfg.pin_memory,
+        drop_last=True
+    )
+
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=cfg.pin_memory
+    )
+
+    return train_loader, val_loader
+"""
+评估函数
+Evaluation Metrics
+"""
+
+import torch
+import numpy as np
+
+
+def compute_iou(pred, target, num_classes=4):
+    """
+    计算每个类别的IoU
+
+    Args:
+        pred: (H, W) 预测类别
+        target: (H, W) 真实类别
+        num_classes: 类别数
+
+    Returns:
+        list of IoU for each class
+    """
+    ious = []
+    pred = pred.reshape(-1)
+    target = target.reshape(-1)
+
+    for cls in range(num_classes):
+        pred_cls = (pred == cls)
+        target_cls = (target == cls)
+
+        intersection = (pred_cls & target_cls).sum()
+        union = (pred_cls | target_cls).sum()
+
+        if union > 0:
+            ious.append(intersection / union)
+        else:
+            ious.append(float('nan'))
+
+    return ious
+
+
+def compute_iou_with_best_perm(pred, masks1, masks2):
+    """
+    计算IoU，考虑最优排列
+
+    由于使用PIT，mito1和mito2的身份可能互换。
+    这里计算两种匹配方式的IoU，取较大的。
+
+    Args:
+        pred: (H, W) 预测的4类标签
+        masks1: (H, W) mito1的真实mask
+        masks2: (H, W) mito2的真实mask
+
+    Returns:
+        best_iou: 两条线粒体的平均IoU（取最优匹配）
+    """
+    # 从4类预测恢复两条线粒体的mask
+    pred_m1 = ((pred == 1) | (pred == 3)).float()
+    pred_m2 = ((pred == 2) | (pred == 3)).float()
+
+    gt_m1 = (masks1 > 0.5).float()
+    gt_m2 = (masks2 > 0.5).float()
+
+    def single_iou(a, b):
+        if isinstance(a, torch.Tensor):
+            inter = (a * b).sum().item()
+            union = (a.sum() + b.sum() - inter).item()
+        else:
+            inter = (a * b).sum()
+            union = a.sum() + b.sum() - inter
+        return inter / (union + 1e-6)
+
+    # 两种匹配方式
+    iou_match1 = (single_iou(pred_m1, gt_m1) + single_iou(pred_m2, gt_m2)) / 2
+    iou_match2 = (single_iou(pred_m1, gt_m2) + single_iou(pred_m2, gt_m1)) / 2
+
+    return max(iou_match1, iou_match2)
+
+
+def evaluate_temporal_consistency(preds):
+    """
+    评估时序一致性
+
+    检查相邻帧之间，同一mito的预测是否在空间上连续。
+
+    Args:
+        preds: (T, H, W) 预测的类别序列
+
+    Returns:
+        consistency: 0-1之间的值，1表示完美一致
+    """
+    T = preds.shape[0]
+    consistencies = []
+
+    for t in range(1, T):
+        prev = preds[t - 1]
+        curr = preds[t]
+
+        # 提取mito1和mito2的区域
+        prev_m1 = ((prev == 1) | (prev == 3))
+        curr_m1 = ((curr == 1) | (curr == 3))
+        prev_m2 = ((prev == 2) | (prev == 3))
+        curr_m2 = ((curr == 2) | (curr == 3))
+
+        # 计算同一身份的重叠 vs 交换身份的重叠
+        if isinstance(prev_m1, torch.Tensor):
+            same = (prev_m1 & curr_m1).sum() + (prev_m2 & curr_m2).sum()
+            swap = (prev_m1 & curr_m2).sum() + (prev_m2 & curr_m1).sum()
+        else:
+            same = (prev_m1 & curr_m1).sum() + (prev_m2 & curr_m2).sum()
+            swap = (prev_m1 & curr_m2).sum() + (prev_m2 & curr_m1).sum()
+
+        if same + swap > 0:
+            if isinstance(same, torch.Tensor):
+                consistencies.append((same.float() / (same + swap).float()).item())
+            else:
+                consistencies.append(same / (same + swap))
+
+    return np.mean(consistencies) if consistencies else 0.0
+
+
+def evaluate_batch(model, dataloader, device, criterion=None):
+    """
+    评估整个数据集
+
+    Returns:
+        metrics: dict containing all metrics
+    """
+    model.eval()
+
+    all_ious = []
+    all_consistencies = []
+    total_loss = 0
+    loss_components = {'seg': 0, 'temporal': 0, 'recon': 0}
+    num_batches = 0
+
+    with torch.no_grad():
+        for images, labels, masks1, masks2 in dataloader:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            outputs = model(images)
+
+            # Loss
+            if criterion is not None:
+                loss, losses, _ = criterion(outputs, labels)
+                total_loss += losses['total']
+                loss_components['seg'] += losses['seg']
+                loss_components['temporal'] += losses['temporal']
+                loss_components['recon'] += losses['recon']
+
+            # 预测
+            preds = outputs.argmax(dim=2).cpu()
+
+            B, T = preds.shape[:2]
+            for b in range(B):
+                # IoU
+                sample_ious = []
+                for t in range(T):
+                    iou = compute_iou_with_best_perm(
+                        preds[b, t], masks1[b, t], masks2[b, t]
+                    )
+                    sample_ious.append(iou)
+                all_ious.append(np.mean(sample_ious))
+
+                # Consistency
+                cons = evaluate_temporal_consistency(preds[b])
+                all_consistencies.append(cons)
+
+            num_batches += 1
+
+    metrics = {
+        'iou': np.mean(all_ious),
+        'iou_std': np.std(all_ious),
+        'consistency': np.mean(all_consistencies),
+        'consistency_std': np.std(all_consistencies),
+    }
+
+    if criterion is not None:
+        metrics['loss'] = total_loss / num_batches
+        metrics['seg_loss'] = loss_components['seg'] / num_batches
+        metrics['temporal_loss'] = loss_components['temporal'] / num_batches
+        metrics['recon_loss'] = loss_components['recon'] / num_batches
+
+    return metrics
+"""
+主训练脚本
+Main Training Script
+
+使用方法：
+    python train.py
+
+确保数据已处理：
+    python scripts/prepare_data.py --input_dir ./data/raw --output_dir ./data/processed
+"""
+
+import os
+import sys
+import time
+import random
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from pathlib import Path
+from tqdm import tqdm
+from datetime import datetime
+
+from config import Config
+from models import ConvLSTMUNet, count_parameters
+from datasets import MitoSequenceDataset, create_dataloaders
+from losses import CombinedLoss
+from evaluation import evaluate_batch
+from visualization import plot_training_curves, visualize_predictions
+
+
+def set_seed(seed):
+    """设置随机种子"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    """训练一个epoch"""
+    model.train()
+
+    total_loss = 0
+    loss_components = {'seg': 0, 'temporal': 0, 'recon': 0}
+    num_batches = 0
+
+    pbar = tqdm(dataloader, desc="Training", leave=False)
+    for images, labels, masks1, masks2 in pbar:
+        images = images.to(device)
+        labels = labels.to(device)
+
+        # 前向传播
+        outputs = model(images)
+        loss, losses, use_swap = criterion(outputs, labels)
+
+        # 反向传播
+        optimizer.zero_grad()
+        loss.backward()
+
+        # 梯度裁剪
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        optimizer.step()
+
+        # 记录
+        total_loss += losses['total']
+        loss_components['seg'] += losses['seg']
+        loss_components['temporal'] += losses['temporal']
+        loss_components['recon'] += losses['recon']
+        num_batches += 1
+
+        pbar.set_postfix({
+            'loss': f"{losses['total']:.4f}",
+            'seg': f"{losses['seg']:.4f}",
+            'temp': f"{losses['temporal']:.4f}"
+        })
+
+    return {
+        'loss': total_loss / num_batches,
+        'seg': loss_components['seg'] / num_batches,
+        'temporal': loss_components['temporal'] / num_batches,
+        'recon': loss_components['recon'] / num_batches,
+    }
+
+
+def main():
+    # 配置
+    cfg = Config
+    cfg.print_config()
+
+    # 设置随机种子
+    set_seed(cfg.seed)
+
+    # 创建输出目录
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = cfg.output_dir / f"run_{timestamp}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 保存配置
+    cfg.save_config(output_dir / "config.txt")
+
+    # 设备
+    device = torch.device(cfg.device)
+    print(f"\n设备: {device}")
+
+    # 数据
+    print("\n加载数据...")
+    train_loader, val_loader = create_dataloaders(cfg)
+    print(f"训练批次: {len(train_loader)}, 验证批次: {len(val_loader)}")
+
+    # 模型
+    print("\n创建模型...")
+    model = ConvLSTMUNet(
+        in_channels=cfg.in_channels,
+        num_classes=cfg.num_classes,
+        base_ch=cfg.base_ch,
+        lstm_hidden=cfg.lstm_hidden,
+        bidirectional=cfg.bidirectional
+    ).to(device)
+
+    print(f"模型参数量: {count_parameters(model) / 1e6:.2f}M")
+
+    # Loss
+    criterion = CombinedLoss(cfg)
+
+    # 优化器
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay
+    )
+
+    # 学习率调度器
+    if cfg.scheduler == 'cosine':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=cfg.epochs, eta_min=cfg.lr_min
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=30, gamma=0.5
+        )
+
+    # 训练历史
+    history = {
+        'train_loss': [], 'train_seg': [], 'train_temporal': [], 'train_recon': [],
+        'val_loss': [], 'val_seg': [], 'val_temporal': [], 'val_recon': [],
+        'val_iou': [], 'val_iou_std': [],
+        'val_consistency': [], 'val_consistency_std': [],
+        'val_epochs': [],
+        'lr': [],
+    }
+
+    best_iou = 0
+    best_consistency = 0
+    epochs_without_improvement = 0
+
+    print("\n开始训练...")
+    print("=" * 70)
+
+    start_time = time.time()
+
+    for epoch in range(1, cfg.epochs + 1):
+        epoch_start = time.time()
+
+        # 训练
+        train_metrics = train_one_epoch(model, train_loader, criterion, optimizer, device)
+
+        # 记录训练指标
+        history['train_loss'].append(train_metrics['loss'])
+        history['train_seg'].append(train_metrics['seg'])
+        history['train_temporal'].append(train_metrics['temporal'])
+        history['train_recon'].append(train_metrics['recon'])
+        history['lr'].append(optimizer.param_groups[0]['lr'])
+
+        # 学习率调度
+        scheduler.step()
+
+        # 验证
+        if epoch % cfg.val_interval == 0:
+            val_metrics = evaluate_batch(model, val_loader, device, criterion)
+
+            history['val_loss'].append(val_metrics['loss'])
+            history['val_seg'].append(val_metrics['seg_loss'])
+            history['val_temporal'].append(val_metrics['temporal_loss'])
+            history['val_recon'].append(val_metrics['recon_loss'])
+            history['val_iou'].append(val_metrics['iou'])
+            history['val_iou_std'].append(val_metrics['iou_std'])
+            history['val_consistency'].append(val_metrics['consistency'])
+            history['val_consistency_std'].append(val_metrics['consistency_std'])
+            history['val_epochs'].append(epoch)
+
+            epoch_time = time.time() - epoch_start
+
+            print(f"\nEpoch {epoch}/{cfg.epochs} ({epoch_time:.1f}s)")
+            print(f"  Train Loss: {train_metrics['loss']:.4f} "
+                  f"(seg={train_metrics['seg']:.4f}, temp={train_metrics['temporal']:.4f}, recon={train_metrics['recon']:.4f})")
+            print(f"  Val Loss:   {val_metrics['loss']:.4f} "
+                  f"(seg={val_metrics['seg_loss']:.4f}, temp={val_metrics['temporal_loss']:.4f}, recon={val_metrics['recon_loss']:.4f})")
+            print(f"  Val IoU: {val_metrics['iou']:.4f} ± {val_metrics['iou_std']:.4f}")
+            print(f"  Val Consistency: {val_metrics['consistency']:.4f} ± {val_metrics['consistency_std']:.4f}")
+            print(f"  LR: {optimizer.param_groups[0]['lr']:.6f}")
+
+            # 保存最佳模型
+            improved = False
+
+            if val_metrics['iou'] > best_iou:
+                best_iou = val_metrics['iou']
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_iou': best_iou,
+                    'consistency': val_metrics['consistency'],
+                }, output_dir / 'best_iou_model.pth')
+                print(f"  -> 保存最佳IoU模型 (IoU={best_iou:.4f})")
+                improved = True
+
+            if val_metrics['consistency'] > best_consistency:
+                best_consistency = val_metrics['consistency']
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_consistency': best_consistency,
+                    'iou': val_metrics['iou'],
+                }, output_dir / 'best_consistency_model.pth')
+                print(f"  -> 保存最佳Consistency模型 (Cons={best_consistency:.4f})")
+                improved = True
+
+            if improved:
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += cfg.val_interval
+
+            # 早停
+            if epochs_without_improvement >= cfg.early_stop_patience:
+                print(f"\n早停: {epochs_without_improvement} epochs无改进")
+                break
+
+        # 定期保存checkpoint
+        if epoch % cfg.save_interval == 0:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'history': history,
+            }, output_dir / f'checkpoint_epoch{epoch}.pth')
+
+    total_time = time.time() - start_time
+    print("\n" + "=" * 70)
+    print(f"训练完成! 总时间: {total_time / 60:.1f} 分钟")
+    print(f"最佳IoU: {best_iou:.4f}")
+    print(f"最佳Consistency: {best_consistency:.4f}")
+
+    # 保存最终模型和历史
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'history': history,
+    }, output_dir / 'final_model.pth')
+
+    torch.save(history, output_dir / 'history.pth')
+
+    # 绘制训练曲线
+    print("\n生成可视化...")
+    plot_training_curves(history, output_dir / 'training_curves.png', cfg)
+
+    # 加载最佳模型进行可视化
+    checkpoint = torch.load(output_dir / 'best_iou_model.pth', map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    visualize_predictions(model, val_loader, output_dir / 'predictions.png', cfg, device)
+
+    # 保存结果摘要
+    with open(output_dir / 'results.txt', 'w') as f:
+        f.write("=" * 50 + "\n")
+        f.write(f"实验: {cfg.exp_name}\n")
+        f.write(f"时间: {timestamp}\n")
+        f.write("=" * 50 + "\n\n")
+        f.write(f"最佳IoU: {best_iou:.4f}\n")
+        f.write(f"最佳Consistency: {best_consistency:.4f}\n")
+        f.write(f"总训练时间: {total_time / 60:.1f} 分钟\n")
+        f.write(f"总Epochs: {epoch}\n\n")
+        f.write("配置:\n")
+        f.write(f"  batch_size: {cfg.batch_size}\n")
+        f.write(f"  lr: {cfg.lr}\n")
+        f.write(f"  base_ch: {cfg.base_ch}\n")
+        f.write(f"  lstm_hidden: {cfg.lstm_hidden}\n")
+        f.write(f"  seg_loss_weight: {cfg.seg_loss_weight}\n")
+        f.write(f"  temporal_loss_weight: {cfg.temporal_loss_weight}\n")
+        f.write(f"  recon_loss_weight: {cfg.recon_loss_weight}\n")
+
+    print(f"\n所有结果保存至: {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
+"""
+可视化函数
+Visualization Functions
+"""
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+from pathlib import Path
+
+from evaluation import compute_iou_with_best_perm, evaluate_temporal_consistency
+
+# 颜色定义
+COLORS = np.array([
+    [0.15, 0.15, 0.15],  # 0: 背景（深灰）
+    [0.9, 0.2, 0.2],  # 1: mito1_only（红）
+    [0.2, 0.4, 0.9],  # 2: mito2_only（蓝）
+    [0.8, 0.2, 0.8],  # 3: overlap（紫）
+])
+
+CLASS_NAMES = ['Background', 'Mito1 only', 'Mito2 only', 'Overlap']
+
+
+def plot_training_curves(history, output_path, cfg):
+    """
+    绘制训练曲线
+
+    包含：
+    - 总Loss（训练+验证）
+    - 各分量Loss
+    - IoU
+    - Temporal Consistency
+    """
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+
+    epochs = range(1, len(history['train_loss']) + 1)
+    val_epochs = history.get('val_epochs', list(range(cfg.val_interval, len(epochs) + 1, cfg.val_interval)))
+
+    # 总Loss
+    ax = axes[0, 0]
+    ax.plot(epochs, history['train_loss'], 'b-', label='Train', linewidth=1.5, alpha=0.8)
+    if 'val_loss' in history:
+        ax.plot(val_epochs, history['val_loss'], 'r-', label='Val', linewidth=2)
+    ax.set_xlabel('Epoch', fontsize=11)
+    ax.set_ylabel('Loss', fontsize=11)
+    ax.set_title('Total Loss', fontsize=12, fontweight='bold')
+    ax.legend(fontsize=10)
+    ax.grid(alpha=0.3)
+
+    # 分割Loss
+    ax = axes[0, 1]
+    ax.plot(epochs, history['train_seg'], 'b-', label='Train', linewidth=1.5, alpha=0.8)
+    if 'val_seg' in history:
+        ax.plot(val_epochs, history['val_seg'], 'r-', label='Val', linewidth=2)
+    ax.set_xlabel('Epoch', fontsize=11)
+    ax.set_ylabel('Loss', fontsize=11)
+    ax.set_title('Segmentation Loss (PIT)', fontsize=12, fontweight='bold')
+    ax.legend(fontsize=10)
+    ax.grid(alpha=0.3)
+
+    # 时序Loss
+    ax = axes[0, 2]
+    ax.plot(epochs, history['train_temporal'], 'b-', label='Train', linewidth=1.5, alpha=0.8)
+    if 'val_temporal' in history:
+        ax.plot(val_epochs, history['val_temporal'], 'r-', label='Val', linewidth=2)
+    ax.set_xlabel('Epoch', fontsize=11)
+    ax.set_ylabel('Loss', fontsize=11)
+    ax.set_title('Temporal Continuity Loss', fontsize=12, fontweight='bold')
+    ax.legend(fontsize=10)
+    ax.grid(alpha=0.3)
+
+    # 重建Loss
+    ax = axes[1, 0]
+    ax.plot(epochs, history['train_recon'], 'b-', label='Train', linewidth=1.5, alpha=0.8)
+    if 'val_recon' in history:
+        ax.plot(val_epochs, history['val_recon'], 'r-', label='Val', linewidth=2)
+    ax.set_xlabel('Epoch', fontsize=11)
+    ax.set_ylabel('Loss', fontsize=11)
+    ax.set_title('Reconstruction Loss', fontsize=12, fontweight='bold')
+    ax.legend(fontsize=10)
+    ax.grid(alpha=0.3)
+
+    # IoU
+    ax = axes[1, 1]
+    if 'val_iou' in history:
+        ax.plot(val_epochs, history['val_iou'], 'g-', linewidth=2, marker='o', markersize=4)
+        ax.fill_between(val_epochs,
+                        np.array(history['val_iou']) - np.array(
+                            history.get('val_iou_std', [0] * len(history['val_iou']))),
+                        np.array(history['val_iou']) + np.array(
+                            history.get('val_iou_std', [0] * len(history['val_iou']))),
+                        alpha=0.2, color='g')
+    ax.set_xlabel('Epoch', fontsize=11)
+    ax.set_ylabel('IoU', fontsize=11)
+    ax.set_title('Validation IoU', fontsize=12, fontweight='bold')
+    ax.set_ylim(0, 1)
+    ax.grid(alpha=0.3)
+
+    # Temporal Consistency
+    ax = axes[1, 2]
+    if 'val_consistency' in history:
+        ax.plot(val_epochs, history['val_consistency'], 'm-', linewidth=2, marker='o', markersize=4)
+    ax.axhline(y=0.5, color='r', linestyle='--', alpha=0.7, label='Random baseline')
+    ax.set_xlabel('Epoch', fontsize=11)
+    ax.set_ylabel('Consistency', fontsize=11)
+    ax.set_title('Temporal Consistency', fontsize=12, fontweight='bold')
+    ax.set_ylim(0, 1)
+    ax.legend(fontsize=10)
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=cfg.vis_dpi, bbox_inches='tight')
+    plt.close()
+    print(f"训练曲线 -> {output_path}")
+
+
+def visualize_predictions(model, dataloader, output_path, cfg, device, num_samples=None):
+    """
+    可视化预测结果
+
+    每个样本显示4行：
+    - 输入图像
+    - GT标签
+    - 预测标签
+    - 预测概率差（P(M1) - P(M2)）
+    """
+    model.eval()
+
+    if num_samples is None:
+        num_samples = cfg.vis_num_samples
+
+    # 收集样本
+    samples = []
+    with torch.no_grad():
+        for images, labels, masks1, masks2 in dataloader:
+            for i in range(images.shape[0]):
+                if len(samples) >= num_samples:
+                    break
+
+                img = images[i:i + 1].to(device)
+                output = model(img)
+                pred = output.argmax(dim=2)[0].cpu().numpy()
+                prob = torch.softmax(output, dim=2)[0].cpu().numpy()
+
+                samples.append({
+                    'images': images[i].numpy()[:, 0],  # (T, H, W)
+                    'labels': labels[i].numpy(),
+                    'preds': pred,
+                    'probs': prob,
+                    'masks1': masks1[i].numpy(),
+                    'masks2': masks2[i].numpy(),
+                })
+
+            if len(samples) >= num_samples:
+                break
+
+    T = samples[0]['images'].shape[0]
+
+    fig, axes = plt.subplots(num_samples * 4, T, figsize=(T * 2.8, num_samples * 9))
+    if num_samples == 1:
+        axes = axes.reshape(4, T)
+
+    for s, sample in enumerate(samples):
+        images = sample['images']
+        labels = sample['labels']
+        preds = sample['preds']
+        probs = sample['probs']
+        masks1 = sample['masks1']
+        masks2 = sample['masks2']
+
+        # 计算指标
+        sample_ious = [compute_iou_with_best_perm(
+            torch.LongTensor(preds[t]),
+            torch.FloatTensor(masks1[t]),
+            torch.FloatTensor(masks2[t])
+        ) for t in range(T)]
+        avg_iou = np.mean(sample_ious)
+        consistency = evaluate_temporal_consistency(torch.LongTensor(preds))
+
+        row_base = s * 4
+
+        for t in range(T):
+            # Row 1: 输入图像
+            ax = axes[row_base, t]
+            img = images[t]
+            vmin, vmax = np.percentile(img, [1, 99])
+            ax.imshow(img, cmap='gray', vmin=vmin, vmax=vmax)
+            ax.axis('off')
+            if t == 0:
+                ax.set_ylabel(f'Sample {s + 1}\nInput', fontsize=10, fontweight='bold')
+            if s == 0:
+                ax.set_title(f'Frame {t}', fontsize=11, fontweight='bold')
+
+            # Row 2: GT标签
+            ax = axes[row_base + 1, t]
+            ax.imshow(COLORS[labels[t]])
+            ax.axis('off')
+            if t == 0:
+                ax.set_ylabel('GT Label', fontsize=10, fontweight='bold')
+
+            # Row 3: 预测标签
+            ax = axes[row_base + 2, t]
+            ax.imshow(COLORS[preds[t]])
+            ax.axis('off')
+            if t == 0:
+                ax.set_ylabel('Prediction', fontsize=10, fontweight='bold')
+
+            # Row 4: 概率差
+            ax = axes[row_base + 3, t]
+            prob_m1 = probs[t, 1] + probs[t, 3]
+            prob_m2 = probs[t, 2] + probs[t, 3]
+            prob_diff = prob_m1 - prob_m2
+            im = ax.imshow(prob_diff, cmap='RdBu_r', vmin=-1, vmax=1)
+            ax.axis('off')
+            if t == 0:
+                ax.set_ylabel('P(M1)-P(M2)', fontsize=10, fontweight='bold')
+
+        # 添加指标
+        axes[row_base, T - 1].text(
+            1.05, 0.5,
+            f'IoU: {avg_iou:.3f}\nCons: {consistency:.3f}',
+            transform=axes[row_base, T - 1].transAxes,
+            fontsize=10,
+            verticalalignment='center',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8)
+        )
+
+    # 添加图例
+    legend_elements = [
+        plt.Rectangle((0, 0), 1, 1, facecolor=COLORS[i], label=CLASS_NAMES[i])
+        for i in range(4)
+    ]
+    fig.legend(handles=legend_elements, loc='upper center', ncol=4, fontsize=10,
+               bbox_to_anchor=(0.5, 0.995))
+
+    # 添加colorbar
+    cbar_ax = fig.add_axes([0.92, 0.15, 0.015, 0.2])
+    sm = plt.cm.ScalarMappable(cmap='RdBu_r', norm=plt.Normalize(-1, 1))
+    sm.set_array([])
+    cbar = fig.colorbar(sm, cax=cbar_ax)
+    cbar.set_label('P(M1) - P(M2)', fontsize=9)
+
+    plt.tight_layout(rect=[0, 0, 0.91, 0.97])
+    plt.savefig(output_path, dpi=cfg.vis_dpi, bbox_inches='tight')
+    plt.close()
+    print(f"预测可视化 -> {output_path}")
+
+
+def visualize_single_sequence(images, labels, preds, probs, output_path, title=""):
+    """
+    可视化单个序列
+    """
+    T = images.shape[0]
+
+    fig, axes = plt.subplots(4, T, figsize=(T * 3, 11))
+
+    for t in range(T):
+        # 输入
+        ax = axes[0, t]
+        img = images[t]
+        vmin, vmax = np.percentile(img, [1, 99])
+        ax.imshow(img, cmap='gray', vmin=vmin, vmax=vmax)
+        ax.axis('off')
+        ax.set_title(f'Frame {t}', fontsize=11)
+        if t == 0:
+            ax.set_ylabel('Input', fontsize=10, fontweight='bold')
+
+        # GT
+        ax = axes[1, t]
+        ax.imshow(COLORS[labels[t]])
+        ax.axis('off')
+        if t == 0:
+            ax.set_ylabel('GT', fontsize=10, fontweight='bold')
+
+        # Prediction
+        ax = axes[2, t]
+        ax.imshow(COLORS[preds[t]])
+        ax.axis('off')
+        if t == 0:
+            ax.set_ylabel('Pred', fontsize=10, fontweight='bold')
+
+        # Probability
+        ax = axes[3, t]
+        prob_m1 = probs[t, 1] + probs[t, 3]
+        prob_m2 = probs[t, 2] + probs[t, 3]
+        ax.imshow(prob_m1 - prob_m2, cmap='RdBu_r', vmin=-1, vmax=1)
+        ax.axis('off')
+        if t == 0:
+            ax.set_ylabel('P(M1)-P(M2)', fontsize=10, fontweight='bold')
+
+    if title:
+        fig.suptitle(title, fontsize=12, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
