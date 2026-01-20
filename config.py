@@ -63,15 +63,15 @@ class Config:
     seg_loss_type = "mse"  # "mse" or "dice"
 
     # 时序连续Loss
-    temporal_loss_weight = 1.0
+    temporal_loss_weight = 0
     temporal_dilate_kernel = 7
 
     # 重建Loss
-    recon_loss_weight = 1.0
+    recon_loss_weight =0
 
     # ==================== 训练参数 ====================
     batch_size = 2  # 256x256图像，batch稍小
-    epochs = 1
+    epochs = 200
     lr = 1e-3
     lr_min = 1e-6
     weight_decay = 1e-4
@@ -80,9 +80,9 @@ class Config:
     scheduler = "cosine"  # "cosine" or "step"
 
     # 验证和保存
-    val_interval = 1  # 每N个epoch验证一次
-    save_interval = 50  # 每N个epoch保存一次checkpoint
-    early_stop_patience = 50  # 早停耐心值
+    val_interval = 10  # 每N个epoch验证一次
+    save_interval = 500  # 每N个epoch保存一次checkpoint
+    early_stop_patience = 80  # 早停耐心值
 
     # ==================== 其他 ====================
     num_workers = 0
