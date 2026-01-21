@@ -209,7 +209,7 @@ def visualize_predictions(model, dataloader, output_path, cfg, device, num_sampl
 
             # Row 4: 概率差
             ax = axes[row_base + 3, t]
-            prob_m1 = probs[t, 1] + probs[t, 3]
+            prob_m1 = probs[t, 1] + probs[t, 2]
             prob_m2 = probs[t, 2] + probs[t, 3]
             prob_diff = prob_m1 - prob_m2
             im = ax.imshow(prob_diff, cmap='RdBu_r', vmin=-1, vmax=1)
@@ -283,7 +283,7 @@ def visualize_single_sequence(images, labels, preds, probs, output_path, title="
 
         # Probability
         ax = axes[3, t]
-        prob_m1 = probs[t, 1] + probs[t, 3]
+        prob_m1 = probs[t, 1] + probs[t, 2]
         prob_m2 = probs[t, 2] + probs[t, 3]
         ax.imshow(prob_m1 - prob_m2, cmap='RdBu_r', vmin=-1, vmax=1)
         ax.axis('off')

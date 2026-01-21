@@ -23,77 +23,145 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# class SequencePITLoss(nn.Module):
+#     """
+#     序列级排列不变Loss
+#
+#     整个序列只选一个最优排列（M1/M2互换），而不是逐帧选择。
+#     这保证了帧间的身份一致性。
+#
+#     交换逻辑：
+#     - 原始: 1=M1_only, 2=Overlap, 3=M2_only
+#     - 交换: 1→3, 3→1, 2保持不变（因为交叠区对两个线粒体是共有的）
+#     """
+#
+#     def __init__(self, num_classes=4, loss_type='mse'):
+#         super().__init__()
+#         self.num_classes = num_classes
+#         self.loss_type = loss_type
+#
+#     def forward(self, pred, target):
+#         """
+#         Args:
+#             pred: (B, T, C, H, W) 预测logits
+#             target: (B, T, H, W) 标签 (0, 1, 2, 3)
+#
+#         Returns:
+#             loss: 标量
+#             use_swap: (B,) 布尔tensor，表示是否使用了交换排列
+#         """
+#         B, T, C, H, W = pred.shape
+#
+#         pred_softmax = torch.softmax(pred, dim=2)
+#
+#         # 原始标签的one-hot
+#         target_onehot1 = torch.zeros_like(pred_softmax)
+#         target_onehot1.scatter_(2, target.view(B, T, 1, H, W), 1)
+#
+#         # ========== 关键修正：交换M1和M2 ==========
+#         # 原始: 0=bg, 1=M1_only, 2=overlap, 3=M2_only
+#         # 交换: 0=bg, 1=M2_only, 2=overlap, 3=M1_only
+#         # 即：1↔3，0和2保持不变
+#         target_swap = target.clone()
+#         mask1 = (target == 1)  # M1独占区
+#         mask3 = (target == 3)  # M2独占区
+#
+#         target_swap[mask1] = 3  # 原来的M1独占 → 变成M2独占
+#         target_swap[mask3] = 1  # 原来的M2独占 → 变成M1独占
+#         # label 0 (背景) 和 label 2 (交叠) 保持不变
+#
+#         target_onehot2 = torch.zeros_like(pred_softmax)
+#         target_onehot2.scatter_(2, target_swap.view(B, T, 1, H, W), 1)
+#
+#         # 计算两种排列的loss（整个序列求和）
+#         if self.loss_type == 'mse':
+#             loss1 = ((pred_softmax - target_onehot1) ** 2).sum(dim=(1, 2, 3, 4))
+#             loss2 = ((pred_softmax - target_onehot2) ** 2).sum(dim=(1, 2, 3, 4))
+#         else:  # dice
+#             loss1 = self._dice_loss(pred_softmax, target_onehot1)
+#             loss2 = self._dice_loss(pred_softmax, target_onehot2)
+#
+#         # 选择更小的排列
+#         use_swap = (loss2 < loss1)
+#         final_loss = torch.where(use_swap, loss2, loss1)
+#
+#         return final_loss.mean(), use_swap
+#
+#     def _dice_loss(self, pred, target, smooth=1e-5):
+#         """Dice loss"""
+#         intersection = (pred * target).sum(dim=(1, 2, 3, 4))
+#         union = pred.sum(dim=(1, 2, 3, 4)) + target.sum(dim=(1, 2, 3, 4))
+#         dice = (2 * intersection + smooth) / (union + smooth)
+#         return 1 - dice
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class SequencePITLoss(nn.Module):
     """
-    序列级排列不变Loss
-
-    整个序列只选一个最优排列（M1/M2互换），而不是逐帧选择。
-    这保证了帧间的身份一致性。
-
-    交换逻辑：
-    - 原始: 1=M1_only, 2=Overlap, 3=M2_only
-    - 交换: 1→3, 3→1, 2保持不变（因为交叠区对两个线粒体是共有的）
+    Per-sample, sequence-level PIT CrossEntropy loss
+    兼容旧版参数（num_classes/loss_type），修复ignore_index=None的类型错误
     """
 
-    def __init__(self, num_classes=4, loss_type='mse'):
+    def __init__(self, ignore_index=None, num_classes=None, loss_type=None):
+        """
+        兼容旧参数的初始化函数：
+        - ignore_index: 要忽略的标签值（int），传None时自动转为-100（PyTorch默认值，不忽略任何标签）
+        - num_classes: 兼容旧调用的占位参数，无实际作用
+        - loss_type: 兼容旧调用的占位参数，无实际作用
+        """
         super().__init__()
+        # 核心修复：将None转为PyTorch默认的ignore_index=-100
+        self.ignore_index = ignore_index if ignore_index is not None else -100
+        # 保留旧参数但不使用（仅为了兼容传递）
         self.num_classes = num_classes
         self.loss_type = loss_type
 
     def forward(self, pred, target):
         """
-        Args:
-            pred: (B, T, C, H, W) 预测logits
-            target: (B, T, H, W) 标签 (0, 1, 2, 3)
+        pred:   (B, T, C, H, W) logits
+        target: (B, T, H, W)    labels in {0,1,2,3}
 
-        Returns:
-            loss: 标量
-            use_swap: (B,) 布尔tensor，表示是否使用了交换排列
+        return:
+            loss: scalar
+            use_swap: (B,) bool tensor
         """
         B, T, C, H, W = pred.shape
 
-        pred_softmax = torch.softmax(pred, dim=2)
+        # -------- 原始标签的 CE loss --------
+        loss_orig = F.cross_entropy(
+            pred.view(B * T, C, H, W),
+            target.view(B * T, H, W),
+            reduction='none',
+            ignore_index=self.ignore_index  # 现在是int类型（-100或你指定的标签）
+        )
+        loss_orig = loss_orig.view(B, T, H, W).sum(dim=(1, 2, 3))  # (B,)
 
-        # 原始标签的one-hot
-        target_onehot1 = torch.zeros_like(pred_softmax)
-        target_onehot1.scatter_(2, target.view(B, T, 1, H, W), 1)
-
-        # ========== 关键修正：交换M1和M2 ==========
-        # 原始: 0=bg, 1=M1_only, 2=overlap, 3=M2_only
-        # 交换: 0=bg, 1=M2_only, 2=overlap, 3=M1_only
-        # 即：1↔3，0和2保持不变
+        # -------- 构造 swap 标签 --------
         target_swap = target.clone()
-        mask1 = (target == 1)  # M1独占区
-        mask3 = (target == 3)  # M2独占区
+        mask1 = (target == 1)
+        mask3 = (target == 3)
+        target_swap[mask1] = 3
+        target_swap[mask3] = 1
 
-        target_swap[mask1] = 3  # 原来的M1独占 → 变成M2独占
-        target_swap[mask3] = 1  # 原来的M2独占 → 变成M1独占
-        # label 0 (背景) 和 label 2 (交叠) 保持不变
+        # -------- swap 标签的 CE loss --------
+        loss_swap = F.cross_entropy(
+            pred.view(B * T, C, H, W),
+            target_swap.view(B * T, H, W),
+            reduction='none',
+            ignore_index=self.ignore_index  # 同样修复
+        )
+        loss_swap = loss_swap.view(B, T, H, W).sum(dim=(1, 2, 3))  # (B,)
 
-        target_onehot2 = torch.zeros_like(pred_softmax)
-        target_onehot2.scatter_(2, target_swap.view(B, T, 1, H, W), 1)
-
-        # 计算两种排列的loss（整个序列求和）
-        if self.loss_type == 'mse':
-            loss1 = ((pred_softmax - target_onehot1) ** 2).sum(dim=(1, 2, 3, 4))
-            loss2 = ((pred_softmax - target_onehot2) ** 2).sum(dim=(1, 2, 3, 4))
-        else:  # dice
-            loss1 = self._dice_loss(pred_softmax, target_onehot1)
-            loss2 = self._dice_loss(pred_softmax, target_onehot2)
-
-        # 选择更小的排列
-        use_swap = (loss2 < loss1)
-        final_loss = torch.where(use_swap, loss2, loss1)
+        # -------- per-sample PIT 选择 --------
+        use_swap = loss_swap < loss_orig
+        final_loss = torch.where(use_swap, loss_swap, loss_orig)
 
         return final_loss.mean(), use_swap
 
-    def _dice_loss(self, pred, target, smooth=1e-5):
-        """Dice loss"""
-        intersection = (pred * target).sum(dim=(1, 2, 3, 4))
-        union = pred.sum(dim=(1, 2, 3, 4)) + target.sum(dim=(1, 2, 3, 4))
-        dice = (2 * intersection + smooth) / (union + smooth)
-        return 1 - dice
-
+# 其他Loss类（TemporalContinuityLoss/ReconstructionLoss/CombinedLoss）保持不变
 
 class TemporalContinuityLoss(nn.Module):
     """
